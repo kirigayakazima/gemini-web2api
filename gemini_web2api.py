@@ -71,9 +71,13 @@ CONFIG = dict(DEFAULT_CONFIG)
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 
 MODELS = {
+    "gemini-3.8-flash": {
+        "mode": 1, "think": 4,
+        "desc": "Latest all-around model (Gemini 3.8 Flash)",
+    },
     "gemini-3.7-flash": {
         "mode": 1, "think": 4,
-        "desc": "Latest all-around model (Gemini 3.7 Flash)",
+        "desc": "All-around model (Gemini 3.7 Flash)",
     },
     "gemini-3.6-flash": {
         "mode": 1, "think": 4,
@@ -105,6 +109,44 @@ MODELS = {
     },
 }
 
+# ─── Model selection header (x-goog-ext-525001261-jspb) ─────────────────────
+# Verified internal model IDs (from browser captures, Issue #82).
+# When this header is absent, upstream ignores slot79 and serves the account
+# default model, so model selection silently no-ops. See:
+#   https://github.com/Sophomoresty/gemini-web2api/issues/82
+MODEL_IDS = {
+    "gemini-3.8-flash": "56fdd199312815e2",   # not yet verified separately; 3.7 ID is stable
+    "gemini-3.7-flash": "56fdd199312815e2",   # cat 1 (verified)
+    "gemini-3.6-flash": "56fdd199312815e2",   # alias to 3.7 id for now
+    "gemini-3.5-flash": "56fdd199312815e2",
+    "gemini-3.1-pro": "e6fa609c3fa255c0",     # cat 3 (verified)
+    "gemini-flash-lite": "8c46e95b1a07cecc",  # cat 6 (verified)
+    "gemini-3.5-flash-thinking": "56fdd199312815e2",
+    "gemini-3.5-flash-thinking-lite": "56fdd199312815e2",
+    "gemini-auto": None,                      # no header = account default
+}
+
+def build_model_header(model_name: str, model_id: int) -> Optional[str]:
+    """Build the x-goog-ext-525001261-jspb model-selection header.
+
+    Contract (Issue #82): [1,null,null,null,"<model_id>",null,null,0,
+    [4,5,6,8,4,5,6,8],null,null,2,null,null,<category>,<extended>,"<uuid>"]
+    idx4 = model selector; idx14 must equal payload slot79; idx15 = slot80.
+    Returns None for models without a known internal ID (-> account default).
+    """
+    mid = MODEL_IDS.get(model_name)
+    if not mid:
+        return None
+    try:
+        return json.dumps(
+            [1, None, None, None, mid, None, None, 0,
+             [4, 5, 6, 8, 4, 5, 6, 8], None, None, 2,
+             None, None, model_id, 0, str(uuid.uuid4())],
+            separators=(",", ":"))
+    except Exception:
+        return None
+
+
 # ─── Utilities ───────────────────────────────────────────────────────────────
 
 def log(msg: str):
@@ -113,8 +155,19 @@ def log(msg: str):
         sys.stderr.flush()
 
 
+_AUTH_FIELDS_LOADED = False
+
+
 def load_cookie() -> tuple:
-    """Load cookie from file. Returns (cookie_str, sapisid)."""
+    """Load cookie from file. Returns (cookie_str, sapisid).
+
+    Also supports the gemini-auth.json format exported by the bundled
+    browser extension: {cookie, sapisid, auth_user, xsrf_token, gemini_bl}.
+    Those auth fields are injected into CONFIG on first load, so the user
+    only needs to point cookie_file at the exported json (no manual config
+    edits for xsrf/bl/auth_user).
+    """
+    global _AUTH_FIELDS_LOADED
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file:
         return "", None
@@ -127,6 +180,18 @@ def load_cookie() -> tuple:
             data = json.loads(content)
             cookie_str = data.get("cookie", "")
             sapisid = data.get("sapisid", "")
+            # Inject auth metadata from the exported json (one-time).
+            if not _AUTH_FIELDS_LOADED:
+                if data.get("xsrf_token"):
+                    CONFIG["xsrf_token"] = data["xsrf_token"]
+                    log(f"xsrf loaded from auth file (len {len(data['xsrf_token'])})")
+                if data.get("gemini_bl"):
+                    CONFIG["gemini_bl"] = data["gemini_bl"]
+                    log("gemini_bl loaded from auth file")
+                if data.get("auth_user") is not None:
+                    CONFIG["auth_user"] = data["auth_user"]
+                    log(f"auth_user loaded from auth file: {data['auth_user']}")
+                _AUTH_FIELDS_LOADED = True
         else:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
@@ -194,6 +259,39 @@ def update_bl_if_needed() -> bool:
     return False
 
 
+def fetch_xsrf_token() -> Optional[str]:
+    """Fetch the current xsrf token (FdrFJe) from the signed-in Gemini page.
+
+    The token moves over time (SNlM0e -> FdrFJe); we probe both. Needed for
+    authenticated StreamGenerate calls; without it requests can be downgraded
+    or rejected. Returns the raw token string or None on failure.
+    """
+    try:
+        req = urllib.request.Request(
+            "https://gemini.google.com/app",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Cookie": load_cookie()[0],
+            })
+        ctx = ssl.create_default_context()
+        proxy = CONFIG.get("proxy")
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+            urllib.request.HTTPSHandler(context=ctx))
+        resp = opener.open(req, timeout=20)
+        html = resp.read().decode("utf-8", errors="replace")
+        m = re.search(r'"FdrFJe"\s*:\s*"(-?\d+)"', html)
+        if m:
+            return m.group(1)
+        m2 = re.search(r'SNlM0e[\'":=\s]*([A-Za-z0-9_\-]{10,})', html)
+        if m2:
+            return m2.group(1)
+        return None
+    except Exception as e:
+        log(f"xsrf fetch failed: {e}")
+        return None
+
+
 def upload_images(images: list) -> list:
     """Upload parsed OpenAI image parts and return Gemini file references."""
     if not images:
@@ -220,7 +318,8 @@ def upload_images(images: list) -> list:
 
 # ─── Gemini Protocol ─────────────────────────────────────────────────────────
 
-def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None) -> str:
+def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
+                           model_name: str = None) -> str:
     """Send prompt to Gemini StreamGenerate with retry."""
     inner = [None] * 80
     if file_refs:
@@ -272,6 +371,9 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
+    model_hdr = build_model_header(model_name, model_id)
+    if model_hdr:
+        headers["x-goog-ext-525001261-jspb"] = model_hdr
 
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
@@ -311,7 +413,8 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     raise last_err
 
 
-def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None):
+def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
+                                model_name: str = None):
     """Send prompt and yield incremental text deltas using httpx streaming."""
     inner = [None] * 80
     if file_refs:
@@ -362,12 +465,15 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
+    model_hdr = build_model_header(model_name, model_id)
+    if model_hdr:
+        headers["x-goog-ext-525001261-jspb"] = model_hdr
 
     proxy = CONFIG.get("proxy")
 
     if not HAS_HTTPX:
         # Fallback: non-streaming with urllib
-        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, model_name)
         text = extract_response_text(raw)
         if text:
             yield text
@@ -762,8 +868,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return None, None, None, f"Unknown model: {model_name}"
         return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
 
-    def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None):
-        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+    def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None, model_name=None):
+        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, model_name)
         text = extract_response_text(raw)
         tool_calls = None
         if tools and text:
@@ -803,7 +909,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                                "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
-                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs):
+                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, model_name):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -822,7 +928,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         # Non-streaming (or tool calling which needs full response)
         try:
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs)
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs, model_name)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -1080,6 +1186,16 @@ def main():
     new_bl = fetch_latest_bl()
     if new_bl:
         CONFIG["gemini_bl"] = new_bl
+
+    if not CONFIG.get("xsrf_token"):
+        tok = fetch_xsrf_token()
+        # fetch_xsrf_token() calls load_cookie() internally, which may have just
+        # injected xsrf from the auth json file. Don't clobber that with the
+        # auto-fetched value — the auth-file value (SNlM0e) is the authoritative
+        # one the page expects as the `at` form field.
+        if tok and not CONFIG.get("xsrf_token"):
+            CONFIG["xsrf_token"] = tok
+            log(f"xsrf auto-fetched (len {len(tok)})")
 
     class ThreadedServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
