@@ -72,7 +72,7 @@ CONFIG = dict(DEFAULT_CONFIG)
 
 MODELS = {
     "gemini-3.8-flash": {
-        "mode": 1, "think": 4,
+        "mode": 1, "think": 1,
         "desc": "Latest all-around model (Gemini 3.8 Flash)",
     },
     "gemini-3.7-flash": {
@@ -150,9 +150,16 @@ def build_model_header(model_name: str, model_id: int) -> Optional[str]:
 # ─── Utilities ───────────────────────────────────────────────────────────────
 
 def log(msg: str):
-    if CONFIG["log_requests"]:
-        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-        sys.stderr.flush()
+    """Log to stderr AND append to server.log (real-time)."""
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}\n"
+    sys.stderr.write(line)
+    sys.stderr.flush()
+    try:
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
 
 
 _AUTH_FIELDS_LOADED = False
@@ -622,6 +629,18 @@ def image_from_part(part: dict):
     return None
 
 
+def _truncate_tool_result(content: str, max_len: int = 1200) -> str:
+    """Trim oversized tool results to keep the prompt lean (faster TTFT)."""
+    if not content:
+        return content
+    if len(content) <= max_len:
+        return content
+    head = content[:max_len]
+    # keep a tail snippet for context (e.g. last error line)
+    tail = content[-200:]
+    return f"{head}\n[... truncated by proxy: {len(content) - max_len} chars omitted ...]\n{tail}"
+
+
 def messages_to_prompt(messages: list, tools: list = None) -> tuple:
     """Convert OpenAI messages to (prompt_str, images_list)."""
     parts = []
@@ -636,11 +655,40 @@ def messages_to_prompt(messages: list, tools: list = None) -> tuple:
                 "parameters": fn.get("parameters", tool.get("parameters", {})),
             })
         if tool_defs:
-            tools_json = json.dumps(tool_defs, indent=2)
-            if len(tools_json) > PROMPT_MAX_BYTES // 2:
-                slim_defs = [{"name": t["name"], "description": t["description"]} for t in tool_defs]
-                tools_json = json.dumps(slim_defs, indent=2)
-                log(f"Tools block too large ({len(tool_defs)} tools), stripped parameters")
+            # Smart compaction: DSH sends 43 tools with verbose descriptions
+            # (32KB total). Google Web takes minutes to process such a large
+            # prompt, causing DSH's 300s stream idle timeout. Strategy:
+            #   - keep FULL parameters (model needs the schema)
+            #   - trim each description to first ~150 chars (core meaning)
+            # This cuts ~32KB down to ~12KB while keeping tools usable.
+            MAX_DESC = 150
+            compact_defs = []
+            for t in tool_defs:
+                d = t.get("description", "")
+                if len(d) > MAX_DESC:
+                    d = d[:MAX_DESC].rstrip() + "…"
+                compact_defs.append({
+                    "name": t.get("name", ""),
+                    "description": d,
+                    "parameters": t.get("parameters", {}),
+                })
+            # Compact JSON: no whitespace
+            TOOLS_BUDGET = PROMPT_MAX_BYTES * 3 // 4
+            tools_json = json.dumps(compact_defs, ensure_ascii=False, separators=(",", ":"))
+            # Breakdown log: largest tool descriptions by size
+            try:
+                sizes = sorted(
+                    ((len(t.get("description", "")), t.get("name", "")) for t in compact_defs),
+                    reverse=True)
+                top = ", ".join(f"{n}({s}B)" for s, n in sizes[:8])
+                log(f"Tools: {len(compact_defs)} compacted {len(tools_json)}B (was {len(json.dumps(tool_defs, ensure_ascii=False, separators=(',', ':')))}B) | largest: {top}")
+            except Exception:
+                pass
+            if len(tools_json) > TOOLS_BUDGET:
+                # Absolute fallback: strip descriptions but STILL keep parameters.
+                slim_defs = [{"name": t["name"], "parameters": t["parameters"]} for t in compact_defs]
+                tools_json = json.dumps(slim_defs, ensure_ascii=False, separators=(",", ":"))
+                log(f"Tools block too large ({len(compact_defs)} tools), stripped descriptions only")
             parts.append(
                 "[System instruction]: You have access to tools. "
                 "To call a tool, respond with:\n"
@@ -677,7 +725,7 @@ def messages_to_prompt(messages: list, tools: list = None) -> tuple:
             else:
                 parts.append(f"[Assistant]: {content}")
         elif role == "tool":
-            parts.append(f"[Tool result for {msg.get('name', '')}]: {content}")
+            parts.append(f"[Tool result for {msg.get('name', '')}]: {_truncate_tool_result(content)}")
         else:
             parts.append(content if content else "")
     return "\n\n".join(p for p in parts if p), images
@@ -745,6 +793,11 @@ def parse_tool_calls(text: str) -> tuple:
 # ─── HTTP Handler ────────────────────────────────────────────────────────────
 
 class GeminiHandler(BaseHTTPRequestHandler):
+    # HTTP/1.0 + connection-close: SSE streams end when the connection closes
+    # (EOF). HTTP/1.1 without chunked encoding makes clients wait forever for
+    # a body terminator that BaseHTTPRequestHandler never sends.
+    protocol_version = "HTTP/1.0"
+
     def log_message(self, fmt, *args):
         client_ip = self.client_address[0] if self.client_address else "-"
         log(f"{client_ip} {fmt % args}")
@@ -757,6 +810,27 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_stream_headers(self):
+        """SSE headers with proxy-buffering disabled for smooth streaming."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+    @staticmethod
+    def _usage_chunk(cid, model_name, prompt, full_text):
+        """Build OpenAI-style usage chunk so DSH usage plugin can count tokens."""
+        p_tokens = max(1, len(prompt) // 4)
+        c_tokens = max(1, len(full_text) // 4)
+        return {
+            "id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+            "model": model_name, "choices": [],
+            "usage": {"prompt_tokens": p_tokens, "completion_tokens": c_tokens,
+                      "total_tokens": p_tokens + c_tokens},
+        }
 
     def _authorized(self):
         keys = CONFIG.get("api_keys") or []
@@ -878,6 +952,32 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def handle_chat(self, body: bytes):
         req = json.loads(body)
+        # Debug: export the real DSH tools JSON once (for prompt-size analysis)
+        try:
+            _tools = req.get("tools")
+            if _tools and len(_tools) >= 40:
+                out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dsh-tools-real.json")
+                if not os.path.exists(out):
+                    with open(out, "w", encoding="utf-8") as f:
+                        json.dump(_tools, f, ensure_ascii=False, indent=1)
+                    log(f"Exported {len(_tools)} DSH tools to dsh-tools-real.json")
+        except Exception:
+            pass
+        # Debug: log request structure that DSH sends (one-time diagnostic)
+        try:
+            msgs = req.get("messages", [])
+            roles = [m.get("role") for m in msgs]
+            last3 = []
+            for m in msgs[-3:]:
+                c = m.get("content", "")
+                cstr = c if isinstance(c, str) else f"<list:{len(c)}>"
+                tcs = f" tc={len(m.get('tool_calls', []))}" if m.get("tool_calls") else ""
+                last3.append(f"{m.get('role')}:{cstr[:50]}{tcs}")
+            log(f"DSH-REQ: keys={list(req.keys())} stream={req.get('stream')} "
+                f"stream_options={req.get('stream_options')} tool_choice={req.get('tool_choice')} "
+                f"msgs={len(msgs)} roles={roles[:5]}... last3={last3}")
+        except Exception as e:
+            log(f"DSH-REQ debug err: {e}")
         model_name, model_id, think_mode, err = self._resolve_model(
             req.get("model", CONFIG["default_model"]))
         if err:
@@ -886,11 +986,23 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tools = req.get("tools")
         prompt, images = messages_to_prompt(req.get("messages", []), tools)
+        # Global prompt budget: keep the head (system/tools + early context) and
+        # the tail (recent turns), collapse the middle to keep TTFT low.
+        # Set high enough that tool definitions (32KB for DSH's 43 tools) are
+        # never clipped; conversation history is trimmed separately in
+        # messages_to_prompt via _truncate_tool_result.
+        MAX_PROMPT = 60000  # ~15k tokens
+        if len(prompt) > MAX_PROMPT:
+            head = prompt[:MAX_PROMPT * 3 // 4]
+            tail = prompt[-MAX_PROMPT // 4:]
+            prompt = f"{head}\n[... proxy: middle of prompt collapsed ...]\n{tail}"
+            log(f"Prompt collapsed: {len(prompt)}B")
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
 
         stream = req.get("stream", False)
+        log(f"REQ: stream={stream} tools={len(tools) if tools else 0} model={model_name} prompt_bytes={len(prompt.encode('utf-8'))}")
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         try:
             file_refs = upload_images(images)
@@ -900,16 +1012,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream and not tools:
             # True streaming: forward chunks as they arrive
+            self._send_stream_headers()
             try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
+                full_text = ""
                 first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                                "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
+                self.wfile.flush()
                 for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, model_name):
+                    full_text += delta_text
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -918,12 +1029,61 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                          "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
                 self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                # Usage chunk for DSH usage plugin
+                usage = self._usage_chunk(cid, model_name, prompt, full_text)
+                self.wfile.write(f"data: {json.dumps(usage, ensure_ascii=False)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
                 log(f"Stream error: {e}")
+            return
+
+        if stream and tools:
+            # True streaming WITH tools: stream text as it arrives (fast TTFT),
+            # then emit tool_calls delta at the end when the JSON block is complete.
+            self._send_stream_headers()
+            try:
+                full_text = ""
+                first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                               "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+                self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
+                self.wfile.flush()
+                # Stream text chunks in real-time
+                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, model_name):
+                    full_text += delta_text
+                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                             "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
+                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                # Parse tool calls from accumulated text
+                clean_text, tool_calls = parse_tool_calls(full_text)
+                if tool_calls:
+                    # Tool JSON block was streamed as plain text; resend cleaned
+                    # content + tool_calls in the final delta so the client gets
+                    # the parsed structure (and the JSON block is removed).
+                    msg = {"role": "assistant", "content": clean_text or None,
+                           "tool_calls": tool_calls}
+                else:
+                    # No tools: text already streamed. Standard OpenAI streams
+                    # end with delta:{} + finish_reason; using content:null can
+                    # confuse strict clients (DSH checks content.length > 0).
+                    msg = {}
+                finish = "tool_calls" if tool_calls else "stop"
+                final_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                               "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
+                self.wfile.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
+                # Usage chunk for DSH usage plugin
+                usage = self._usage_chunk(cid, model_name, prompt, full_text)
+                self.wfile.write(f"data: {json.dumps(usage, ensure_ascii=False)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                log(f"STREAM-COMPLETE: {cid} finish={finish} text={len(full_text)}B tools={len(tool_calls)}")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                log(f"Stream tool error: {e}")
             return
 
         # Non-streaming (or tool calling which needs full response)
@@ -939,15 +1099,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
         finish = "tool_calls" if tool_calls else "stop"
 
         if stream:
-            # Stream mode with tools: send as single chunk (need full parse for tool_calls)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
+            # Stream mode with tools: full response as delta (tool_calls parsed), then usage
+            self._send_stream_headers()
             chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                      "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
             self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+            # Usage chunk for DSH usage plugin
+            usage = self._usage_chunk(cid, model_name, prompt, text)
+            self.wfile.write(f"data: {json.dumps(usage, ensure_ascii=False)}\n\n".encode())
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         else:
