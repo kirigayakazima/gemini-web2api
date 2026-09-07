@@ -61,8 +61,94 @@ DEFAULT_CONFIG = {
     "cookie_file": None,
     "proxy": None,
     "api_keys": [],
-    "temporary_chats": False,
+    "temporary_chats": True,
+    "persistent_chat": False,
 }
+
+# ─── Persistent chat window (for cache reuse) ────────────────────────────────
+# When persistent_chat is enabled, the proxy reuses the SAME Gemini Web chat
+# across requests within a DSH session window, so Google can serve a prefix KV
+# cache (faster, less quota). The window is detected heuristically from the
+# OpenAI messages array: an increasing message count = same chat continuing;
+# a shrink (new DSH window / history reset) = start a fresh chat.
+class ChatWindow:
+    """Tracks the active Gemini Web conversation so persistent_chat can reuse
+    it across requests (prefix KV cache reuse). Conversation continuation on
+    the web protocol works via inner[2] = [conv_id, resp_id, ...]:
+      - conv_id (c_xxx) identifies the conversation; stays stable.
+      - resp_id (r_xxx) is the last response id; must be updated each turn.
+    New window is detected heuristically: no history, message count shrink
+    (new DSH window / history reset), or idle timeout."""
+
+    def __init__(self):
+        self.conv_id = None          # c_xxx (stable)
+        self.resp_id = None          # r_xxx (updates every turn)
+        self.sent_msg_count = 0      # msgs already sent to Google in this window
+        self.last_msg_count = None
+        self.last_ts = None
+        self.is_new_window = False   # set by resolve() for the current request
+        self._pending_send_count = 0  # msg count to advance on successful response
+
+    def resolve(self, msg_count: int, idle_timeout_s: int = 1800) -> None:
+        """Decide whether this request continues the current chat. If it is a
+        new window, reset conv/resp ids so the next request starts fresh."""
+        import time as _t
+        now = _t.time()
+        is_new = (
+            self.conv_id is None
+            or self.last_msg_count is None
+            or msg_count < self.last_msg_count
+            or (self.last_ts is not None and now - self.last_ts > idle_timeout_s)
+        )
+        self.is_new_window = is_new
+        if is_new:
+            self.conv_id = None
+            self.resp_id = None
+            self.sent_msg_count = 0
+            log(f"ChatWindow: new window (msgs={msg_count})")
+        else:
+            log(f"ChatWindow: continue window (msgs={msg_count} conv={self.conv_id[:8] if self.conv_id else None})")
+        self.last_msg_count = msg_count
+        self.last_ts = now
+
+    def update_from_response(self, conv_id, resp_id) -> None:
+        """Store conversation ids observed in a response (called after a turn)."""
+        if conv_id:
+            self.conv_id = conv_id
+        if resp_id:
+            self.resp_id = resp_id
+        # A real c_ id confirms this request succeeded upstream, so the sent
+        # counter can advance (next request sends only the delta).
+        if conv_id and self._pending_send_count:
+            self.advance_sent(self._pending_send_count)
+            self._pending_send_count = 0
+
+    def advance_sent(self, msg_count: int) -> None:
+        """Mark msg_count messages as successfully sent to the current chat.
+        Called only after a successful upstream response, so a failed turn that
+        DSH retries re-sends the same tail instead of computing an empty delta."""
+        if msg_count > self.sent_msg_count:
+            self.sent_msg_count = msg_count
+
+    def mark_request_sent(self, msg_count: int) -> None:
+        """Record the current request's total msg count as 'to be advanced'
+        once the upstream responds successfully. Falls back safely if the
+        window is not active."""
+        self._pending_send_count = msg_count if self.active else 0
+
+    def confirm_sent(self) -> None:
+        """Called after a successful upstream response: advance the sent
+        counter so the next request only sends the delta."""
+        if getattr(self, "_pending_send_count", 0):
+            self.advance_sent(self._pending_send_count)
+            self._pending_send_count = 0
+
+    @property
+    def active(self) -> bool:
+        return self.conv_id is not None
+
+
+CHAT_WINDOW = ChatWindow()
 
 CONFIG = dict(DEFAULT_CONFIG)
 
@@ -72,7 +158,7 @@ CONFIG = dict(DEFAULT_CONFIG)
 
 MODELS = {
     "gemini-3.8-flash": {
-        "mode": 1, "think": 1,
+        "mode": 1, "think": 0,
         "desc": "Latest all-around model (Gemini 3.8 Flash)",
     },
     "gemini-3.7-flash": {
@@ -225,11 +311,53 @@ def account_prefix() -> str:
 
 def apply_chat_persistence_flags(inner: list) -> None:
     """Apply Gemini Web persistence flags to an outgoing request payload."""
-    if CONFIG.get("temporary_chats", False):
+    if CONFIG.get("persistent_chat", False):
+        # Persistent chat: keep the same conversation across requests so Google
+        # can reuse prefix KV cache. This does leave traces in the web UI.
+        inner[41] = [2]
+    elif CONFIG.get("temporary_chats", False):
         inner[41] = [1]
         inner[45] = 1
     else:
         inner[41] = [2]
+
+
+def apply_chat_window(inner: list) -> None:
+    """Inject the active persistent conversation ids into inner[2].
+
+    Protocol (verified): inner[2][0] = conversation id (c_xxx, stable),
+    inner[2][1] = last response id (r_xxx, updates each turn). Leaving both
+    empty starts a brand-new conversation (stateless / no cache reuse).
+    Also keeps inner[59] as a fresh per-request uuid.
+    """
+    if CONFIG.get("persistent_chat", False) and CHAT_WINDOW.active:
+        inner[2] = [CHAT_WINDOW.conv_id, CHAT_WINDOW.resp_id,
+                    "", None, None, None, None, None, None, ""]
+    inner[59] = str(uuid.uuid4())
+
+
+def _capture_session_ids(raw: str) -> None:
+    """Scan a raw StreamGenerate response and store conv_id (c_xxx) and the
+    latest response id (r_xxx) into CHAT_WINDOW for conversation continuation."""
+    if not CONFIG.get("persistent_chat", False):
+        return
+    try:
+        for line in raw.split("\n"):
+            if '"wrb.fr"' not in line:
+                continue
+            arr = json.loads(line)
+            inner_str = arr[0][2]
+            if not inner_str:
+                continue
+            inner2 = json.loads(inner_str)
+            if isinstance(inner2, list) and len(inner2) > 1 and isinstance(inner2[1], list):
+                c = inner2[1][0] if len(inner2[1]) > 0 else None
+                r = inner2[1][1] if len(inner2[1]) > 1 else None
+                if isinstance(c, str) and c.startswith("c_"):
+                    CHAT_WINDOW.update_from_response(c, r if isinstance(r, str) and r.startswith("r_") else None)
+                    break
+    except (json.JSONDecodeError, IndexError, TypeError):
+        pass
 
 
 def fetch_latest_bl() -> Optional[str]:
@@ -345,8 +473,8 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     inner[27] = 1
     inner[30] = [4]
     apply_chat_persistence_flags(inner)
+    apply_chat_window(inner)
     inner[53] = 0
-    inner[59] = str(uuid.uuid4())
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
@@ -396,7 +524,12 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
                 resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            return resp.read().decode("utf-8", errors="replace")
+            raw = resp.read().decode("utf-8", errors="replace")
+            # Persistent chat: capture c_/r_ ids from the raw response so the
+            # next request continues this conversation (prefix KV cache reuse).
+            if CONFIG.get("persistent_chat", False):
+                _capture_session_ids(raw)
+            return raw
         except urllib.error.HTTPError as e:
             if e.code == 405 and update_bl_if_needed():
                 reqid = int(time.time()) % 1000000
@@ -440,8 +573,8 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     inner[27] = 1
     inner[30] = [4]
     apply_chat_persistence_flags(inner)
+    apply_chat_window(inner)
     inner[53] = 0
-    inner[59] = str(uuid.uuid4())
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
@@ -510,6 +643,18 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                             if not inner_str or len(inner_str) < 50:
                                 continue
                             inner2 = json.loads(inner_str)
+                            # Persistent chat: capture conv_id (c_xxx) and
+                            # response id (r_xxx) so the next request can
+                            # continue this conversation (prefix KV cache).
+                            if CONFIG.get("persistent_chat", False) and isinstance(inner2, list) and len(inner2) > 1 and isinstance(inner2[1], list):
+                                try:
+                                    _c = inner2[1][0] if len(inner2[1]) > 0 else None
+                                    _r = inner2[1][1] if len(inner2[1]) > 1 else None
+                                    if (isinstance(_c, str) and _c.startswith("c_")) or (isinstance(_r, str) and _r.startswith("r_")):
+                                        CHAT_WINDOW.update_from_response(_c if isinstance(_c, str) and _c.startswith("c_") else None,
+                                                                         _r if isinstance(_r, str) and _r.startswith("r_") else None)
+                                except Exception:
+                                    pass
                             if isinstance(inner2, list) and len(inner2) > 4 and inner2[4]:
                                 for part in inner2[4]:
                                     if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
@@ -655,42 +800,55 @@ def messages_to_prompt(messages: list, tools: list = None) -> tuple:
                 "parameters": fn.get("parameters", tool.get("parameters", {})),
             })
         if tool_defs:
-            # Smart compaction: DSH sends 43 tools with verbose descriptions
-            # (32KB total). Google Web takes minutes to process such a large
-            # prompt, causing DSH's 300s stream idle timeout. Strategy:
-            #   - keep FULL parameters (model needs the schema)
-            #   - trim each description to first ~150 chars (core meaning)
-            # This cuts ~32KB down to ~12KB while keeping tools usable.
+            # ── Tool filter + compact for speed ──────────────────────────
+            # DSH sends 43 tools (~34KB / 8650 tok). The dev_*/job_*/goals
+            # series are rarely needed and bulk up the prompt; core 10 tools
+            # cover 90%+ daily coding. Keep full parameters, trim description
+            # to the first sentence (~150 chars) to preserve call accuracy.
+            CORE_TOOL_NAMES = {
+                'read', 'edit', 'write', 'grep', 'glob', 'pwsh',
+                'web_search', 'todo_write', 'todo_read', 'subagent',
+            }
+            filtered = []
+            skipped = 0
+            for t in tool_defs:
+                if t.get("name", "") in CORE_TOOL_NAMES:
+                    filtered.append(t)
+                else:
+                    skipped += 1
+            if skipped:
+                log(f"Tool filter: {len(tool_defs)} → {len(filtered)} core tools ({skipped} dev/job/goals skipped)")
             MAX_DESC = 150
             compact_defs = []
-            for t in tool_defs:
-                d = t.get("description", "")
+            for t in filtered:
+                d = t.get("description", "") or ""
+                # Keep the first sentence (usually the core meaning).
+                d = d.split('.')[0].split('\n')[0].strip()
                 if len(d) > MAX_DESC:
-                    d = d[:MAX_DESC].rstrip() + "…"
+                    d = d[:MAX_DESC].rstrip() + "..."
                 compact_defs.append({
                     "name": t.get("name", ""),
                     "description": d,
                     "parameters": t.get("parameters", {}),
                 })
-            # Compact JSON: no whitespace
             TOOLS_BUDGET = PROMPT_MAX_BYTES * 3 // 4
             tools_json = json.dumps(compact_defs, ensure_ascii=False, separators=(",", ":"))
-            # Breakdown log: largest tool descriptions by size
             try:
-                sizes = sorted(
-                    ((len(t.get("description", "")), t.get("name", "")) for t in compact_defs),
-                    reverse=True)
-                top = ", ".join(f"{n}({s}B)" for s, n in sizes[:8])
-                log(f"Tools: {len(compact_defs)} compacted {len(tools_json)}B (was {len(json.dumps(tool_defs, ensure_ascii=False, separators=(',', ':')))}B) | largest: {top}")
+                sizes = sorted(((len(json.dumps(t, ensure_ascii=False, separators=(",",":"))), t.get("name","")) for t in compact_defs), reverse=True)
+                top = ", ".join(f"{n}({s}B)" for s, n in sizes[:5])
+                log(f"Tools: {len(compact_defs)} core, {len(tools_json)}B | {top}")
             except Exception:
                 pass
             if len(tools_json) > TOOLS_BUDGET:
-                # Absolute fallback: strip descriptions but STILL keep parameters.
                 slim_defs = [{"name": t["name"], "parameters": t["parameters"]} for t in compact_defs]
                 tools_json = json.dumps(slim_defs, ensure_ascii=False, separators=(",", ":"))
                 log(f"Tools block too large ({len(compact_defs)} tools), stripped descriptions only")
             parts.append(
-                "[System instruction]: You have access to tools. "
+                "[System instruction]: You are a coding agent with real tools available. "
+                "When the user asks you to CREATE files, WRITE code, EDIT files, "
+                "SEARCH the web, RUN commands, or MANAGE tasks — you MUST call the "
+                "appropriate tool. Do NOT simply describe what you would do in text; "
+                "actually invoke the tool. If no tool is needed, answer directly.\n\n"
                 "To call a tool, respond with:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 "Only use tool_call blocks when needed.\n\n"
@@ -969,15 +1127,32 @@ class GeminiHandler(BaseHTTPRequestHandler):
             roles = [m.get("role") for m in msgs]
             last3 = []
             for m in msgs[-3:]:
-                c = m.get("content", "")
-                cstr = c if isinstance(c, str) else f"<list:{len(c)}>"
+                c = m.get("content")
+                if c is None:
+                    cstr = "<None>"
+                elif isinstance(c, str):
+                    cstr = c[:50]
+                elif isinstance(c, list):
+                    cstr = f"<list:{len(c)}>"
+                else:
+                    cstr = repr(c)[:50]
                 tcs = f" tc={len(m.get('tool_calls', []))}" if m.get("tool_calls") else ""
-                last3.append(f"{m.get('role')}:{cstr[:50]}{tcs}")
+                last3.append(f"{m.get('role')}:{cstr}{tcs}")
             log(f"DSH-REQ: keys={list(req.keys())} stream={req.get('stream')} "
                 f"stream_options={req.get('stream_options')} tool_choice={req.get('tool_choice')} "
                 f"msgs={len(msgs)} roles={roles[:5]}... last3={last3}")
         except Exception as e:
             log(f"DSH-REQ debug err: {e}")
+        # Persistent chat: resolve the shared Gemini conversation from the
+        # message window (same chat across requests => Google prefix KV cache
+        # reuse). The conv/resp ids from the last response are injected into
+        # inner[2] by the request builders; when persistent_chat is off the
+        # window is not consulted and every request is stateless (fresh chat).
+        try:
+            if CONFIG.get("persistent_chat", False):
+                CHAT_WINDOW.resolve(len(req.get("messages", [])))
+        except Exception as e:
+            log(f"ChatWindow resolve err: {e}")
         model_name, model_id, think_mode, err = self._resolve_model(
             req.get("model", CONFIG["default_model"]))
         if err:
@@ -985,7 +1160,57 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tools = req.get("tools")
-        prompt, images = messages_to_prompt(req.get("messages", []), tools)
+        all_msgs = req.get("messages", [])
+        # ── Pure-incremental persistent chat ─────────────────────────────
+        # persistent_chat=true + an ongoing window: only the messages added
+        # since the last successfully-sent request are forwarded to Gemini
+        # (Google's server keeps the conversation memory via conv_id). The
+        # first request of a window sends everything (system + tools + history)
+        # to seed the conversation.
+        persist_mode = CONFIG.get("persistent_chat", False)
+        if persist_mode and not CHAT_WINDOW.is_new_window and CHAT_WINDOW.active and CHAT_WINDOW.sent_msg_count > 0:
+            start = CHAT_WINDOW.sent_msg_count
+            if len(all_msgs) > start:
+                send_msgs = all_msgs[start:]
+                prompt, images = messages_to_prompt(send_msgs, None)  # no tool re-injection
+                log(f"Persist-incremental: {len(send_msgs)} new msgs (of {len(all_msgs)}), sent_idx={start}")
+            else:
+                # Nothing genuinely new (retry of a failed turn): fall back to
+                # full send to be safe.
+                prompt, images = messages_to_prompt(all_msgs, tools)
+                log(f"Persist-incremental: no new msgs, fallback full ({len(all_msgs)})")
+        else:
+            prompt, images = messages_to_prompt(all_msgs, tools)
+        # PROMPT-STATS: structured breakdown of what goes into the prompt
+        # (which roles / how many / char counts / est. tokens). Content is NOT
+        # printed — only sizes — so it's cheap and stays readable.
+        try:
+            msgs = req.get("messages", [])
+            role_counts = {}
+            sys_chars = user_chars = asst_chars = tool_chars = 0
+            for m in msgs:
+                r = m.get("role", "?")
+                role_counts[r] = role_counts.get(r, 0) + 1
+                c = m.get("content")
+                n = len(c) if isinstance(c, str) else (sum(len(p.get("text", "")) for p in c if isinstance(p, dict) and isinstance(p.get("text"), str)) if isinstance(c, list) else 0)
+                if r == "system": sys_chars += n
+                elif r == "user": user_chars += n
+                elif r == "assistant": asst_chars += n
+                elif r == "tool": tool_chars += n
+            tools_json_chars = 0
+            if tools:
+                try:
+                    _compact = [{"name": t.get("name", ""), "description": (t.get("description", "") or "")[:150], "parameters": t.get("parameters", {})} for t in tools]
+                    tools_json_chars = len(json.dumps(_compact, ensure_ascii=False, separators=(",", ":")))
+                except Exception:
+                    pass
+            prompt_chars = len(prompt)
+            est_tok = prompt_chars // 4
+            log(f"PROMPT-STATS: msgs={len(msgs)} roles={role_counts} | "
+                f"sys={sys_chars}B user={user_chars}B asst={asst_chars}B tool={tool_chars}B "
+                f"tools_json={tools_json_chars}B | prompt_total={prompt_chars}B (~{est_tok} tok)")
+        except Exception as e:
+            log(f"PROMPT-STATS err: {e}")
         # Global prompt budget: keep the head (system/tools + early context) and
         # the tail (recent turns), collapse the middle to keep TTFT low.
         # Set high enough that tool definitions (32KB for DSH's 43 tools) are
@@ -1000,6 +1225,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
+        # Record the total msg count so the persistent-window counter advances
+        # only after a successful upstream response (confirm_sent via update_from_response).
+        if persist_mode:
+            CHAT_WINDOW.mark_request_sent(len(all_msgs))
 
         stream = req.get("stream", False)
         log(f"REQ: stream={stream} tools={len(tools) if tools else 0} model={model_name} prompt_bytes={len(prompt.encode('utf-8'))}")
@@ -1041,36 +1270,98 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         if stream and tools:
-            # True streaming WITH tools: stream text as it arrives (fast TTFT),
-            # then emit tool_calls delta at the end when the JSON block is complete.
+            # True streaming WITH tools: stream plain text as it arrives (fast
+            # TTFT), but buffer ```tool_call JSON blocks so they are NOT leaked
+            # into content — emit parsed tool_calls delta at the end instead.
+            # (Leaking the JSON into content makes clients like DSH treat the
+            #  turn as a text reply and never execute the tool.)
             self._send_stream_headers()
             try:
-                full_text = ""
                 first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                                "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
                 self.wfile.flush()
-                # Stream text chunks in real-time
-                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, model_name):
-                    full_text += delta_text
+
+                TOOL_START = "```tool_call"
+                TOOL_END = "\n```"
+                pending = ""          # text not yet classified
+                in_tool = False
+                tool_calls = []
+                full_text = ""        # full raw text (for usage estimate)
+                text_sent = ""        # text streamed as content
+
+                def send_content(txt):
+                    if not txt:
+                        return
+                    nonlocal text_sent
+                    text_sent += txt
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                             "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
+                             "model": model_name, "choices": [{"index": 0, "delta": {"content": txt}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
                     self.wfile.flush()
-                # Parse tool calls from accumulated text
-                clean_text, tool_calls = parse_tool_calls(full_text)
+
+                def parse_block(block_text):
+                    """Parse one ```tool_call JSON block into a tool call dict."""
+                    try:
+                        data = json.loads(block_text.strip())
+                        return {
+                            "id": f"call_{uuid.uuid4().hex[:8]}",
+                            "type": "function",
+                            "function": {
+                                "name": data["name"],
+                                "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
+                            },
+                        }
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        return None
+
+                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, model_name):
+                    full_text += delta_text
+                    pending += delta_text
+                    # Process the pending buffer until it stabilizes (no
+                    # tool block open and no new one started).
+                    stable = False
+                    while not stable:
+                        stable = True
+                        if not in_tool:
+                            idx = pending.find(TOOL_START)
+                            if idx >= 0:
+                                send_content(pending[:idx])
+                                pending = pending[idx:]
+                                in_tool = True
+                                stable = False
+                            else:
+                                # Stream all but a tail that could become the
+                                # tool block opener (cross-chunk safety).
+                                keep = min(len(pending), len(TOOL_START) - 1)
+                                if len(pending) > keep:
+                                    send_content(pending[:-keep] if keep else pending)
+                                    pending = pending[-keep:] if keep else ""
+                        else:
+                            # Try to close the open tool block right away.
+                            end_idx = pending.find(TOOL_END, len(TOOL_START))
+                            if end_idx >= 0:
+                                block = pending[len(TOOL_START):end_idx]
+                                tc = parse_block(block)
+                                if tc:
+                                    tool_calls.append(tc)
+                                pending = pending[end_idx + len(TOOL_END):]
+                                in_tool = False
+                                stable = False
+                # Any remaining plain text after the loop.
+                if pending and not in_tool:
+                    send_content(pending)
+                elif pending and in_tool:
+                    # Unterminated tool block: drop it from content.
+                    log(f"Unterminated tool block, dropped {len(pending)}B")
+
+                # Final chunk: emit tool_calls (if any) + finish_reason.
                 if tool_calls:
-                    # Tool JSON block was streamed as plain text; resend cleaned
-                    # content + tool_calls in the final delta so the client gets
-                    # the parsed structure (and the JSON block is removed).
-                    msg = {"role": "assistant", "content": clean_text or None,
-                           "tool_calls": tool_calls}
+                    msg = {"role": "assistant", "content": text_sent or None, "tool_calls": tool_calls}
+                    finish = "tool_calls"
                 else:
-                    # No tools: text already streamed. Standard OpenAI streams
-                    # end with delta:{} + finish_reason; using content:null can
-                    # confuse strict clients (DSH checks content.length > 0).
                     msg = {}
-                finish = "tool_calls" if tool_calls else "stop"
+                    finish = "stop"
                 final_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                                "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
                 self.wfile.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
@@ -1079,7 +1370,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.wfile.write(f"data: {json.dumps(usage, ensure_ascii=False)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
-                log(f"STREAM-COMPLETE: {cid} finish={finish} text={len(full_text)}B tools={len(tool_calls)}")
+                log(f"STREAM-COMPLETE: {cid} finish={finish} text={len(text_sent)}B tools={len(tool_calls)} raw={full_text[:120]!r}")
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
